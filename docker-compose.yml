@@ -1,0 +1,338 @@
+# Учебный стенд: Apache Iceberg + каталог Lakekeeper + права OpenFGA + Trino.
+# Основа - официальные examples/access-control-simple и access-control-advanced
+# из репозитория lakekeeper/lakekeeper. Хранилище S3 - RustFS вместо MinIO,
+# перед Trino nginx с HTTPS на 8443, тестовые данные - встроенный каталог Trino tpch.
+#
+# Все пароли и секреты здесь учебные и опубликованы вместе с репозиторием.
+# Для чего-то кроме локальных опытов стенд не годится, см. docs/06-limitations.md.
+
+name: iceberg-lab
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-lakekeeper-env: &lakekeeper-env
+  LAKEKEEPER__PG_ENCRYPTION_KEY: local-lab-not-secure
+  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@db:5432/postgres
+  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@db:5432/postgres
+  LAKEKEEPER__AUTHZ_BACKEND: openfga
+  LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
+  LAKEKEEPER__OPENFGA__CLIENT_ID: openfga
+  LAKEKEEPER__OPENFGA__CLIENT_SECRET: KiPzUfuj9GKWlEJlvTXRRC2haFrLeKbW
+  LAKEKEEPER__OPENFGA__TOKEN_ENDPOINT: http://keycloak:8080/realms/iceberg/protocol/openid-connect/token
+  LAKEKEEPER__OPENID_PROVIDER_URI: http://keycloak:8080/realms/iceberg
+  # токены, полученные в браузере, выданы от имени localhost:30080
+  LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS: http://localhost:30080/realms/iceberg
+  LAKEKEEPER__OPENID_AUDIENCE: lakekeeper
+  LAKEKEEPER__UI__OPENID_CLIENT_ID: lakekeeper
+  LAKEKEEPER__UI__OPENID_PROVIDER_URI: http://localhost:30080/realms/iceberg
+  RUST_LOG: info
+
+services:
+  # Разовая генерация сертификата nginx и общего секрета Trino.
+  # Файлы живут в томе lab-secrets, при повторных запусках не пересоздаются.
+  secrets-init:
+    image: postgres:17
+    container_name: lab-secrets-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "/init/gen-secrets.sh"]
+    volumes:
+      - ./init/gen-secrets.sh:/init/gen-secrets.sh:ro
+      - lab-secrets:/secrets
+    logging: *logging
+
+  db:
+    image: postgres:17
+    container_name: lab-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging: *logging
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0
+    container_name: lab-rustfs
+    restart: unless-stopped
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9100
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9101
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfs-lab-secret
+    ports:
+      - "127.0.0.1:9100:9100"
+      - "127.0.0.1:9101:9101"
+    volumes:
+      - rustfs-data:/data
+    networks:
+      default:
+        # Каталог выдаёт клиентам адрес S3 http://rustfs.localhost:9100.
+        # Внутри docker это имя ведёт сюда, а браузер любое *.localhost сам отправляет
+        # на 127.0.0.1, где опубликован тот же порт. Так предпросмотр данных в UI
+        # Lakekeeper работает без правки файла hosts.
+        aliases:
+          - rustfs.localhost
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9100/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    logging: *logging
+
+  create-bucket:
+    image: amazon/aws-cli:2.37.4
+    container_name: lab-create-bucket
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfs-lab-secret
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        S3="aws --endpoint-url http://rustfs.localhost:9100"
+        $$S3 s3api head-bucket --bucket warehouse 2>/dev/null || $$S3 s3api create-bucket --bucket warehouse
+        $$S3 s3api put-bucket-cors --bucket warehouse --cors-configuration file:///init/cors.json
+        echo "bucket warehouse ready"
+    volumes:
+      - ./init/cors.json:/init/cors.json:ro
+    logging: *logging
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.0
+    container_name: lab-keycloak
+    restart: unless-stopped
+    command: ["start-dev", "--health-enabled=true", "--import-realm", "--features=token-exchange"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports:
+      - "127.0.0.1:30080:8080"
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'exec 3<>/dev/tcp/127.0.0.1/8080;echo -e "GET /realms/iceberg/.well-known/openid-configuration HTTP/1.1\r\nhost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n" >&3;grep "jwks_uri" <&3'
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    logging: *logging
+
+  openfga-db:
+    image: postgres:17
+    container_name: lab-openfga-db
+    restart: unless-stopped
+    command: -c max_connections=500
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - openfga-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging: *logging
+
+  openfga-migrate:
+    image: openfga/openfga:v1.14
+    container_name: lab-openfga-migrate
+    restart: "no"
+    command: migrate
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://postgres:postgres@openfga-db:5432/postgres?sslmode=disable
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+    logging: *logging
+
+  openfga:
+    image: openfga/openfga:v1.14
+    container_name: lab-openfga
+    restart: unless-stopped
+    command: run
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://postgres:postgres@openfga-db:5432/postgres?sslmode=disable
+      OPENFGA_DATASTORE_MAX_OPEN_CONNS: "200"
+      OPENFGA_DATASTORE_MAX_IDLE_CONNS: "100"
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_AUTHN_METHOD: oidc
+      OPENFGA_AUTHN_OIDC_ISSUER: http://keycloak:8080/realms/iceberg
+      OPENFGA_AUTHN_OIDC_ISSUER_ALIASES: http://localhost:30080/realms/iceberg
+      OPENFGA_AUTHN_OIDC_AUDIENCE: openfga
+      OPENFGA_HTTP_TLS_ENABLED: "false"
+      OPENFGA_CACHE_CONTROLLER_ENABLED: "true"
+      OPENFGA_CHECK_QUERY_CACHE_ENABLED: "true"
+      OPENFGA_CHECK_ITERATOR_CACHE_ENABLED: "true"
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=openfga:8081"]
+      interval: 5s
+      timeout: 30s
+      retries: 10
+    logging: *logging
+
+  migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    container_name: lab-lakekeeper-migrate
+    restart: "no"
+    command: ["migrate"]
+    environment: *lakekeeper-env
+    depends_on:
+      db:
+        condition: service_healthy
+      openfga:
+        condition: service_healthy
+    logging: *logging
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    container_name: lab-lakekeeper
+    restart: unless-stopped
+    command: ["serve"]
+    environment: *lakekeeper-env
+    ports:
+      - "127.0.0.1:8181:8181"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      create-bucket:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    logging: *logging
+
+  # Разовая настройка каталога: bootstrap, роли engineer/trino/loader, warehouse demo.
+  lk-init:
+    image: curlimages/curl:8.22.0
+    container_name: lab-lk-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "/init/lk-init.sh"]
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    volumes:
+      - ./init/lk-init.sh:/init/lk-init.sh:ro
+      - ./init/create-warehouse.json:/init/create-warehouse.json:ro
+    logging: *logging
+
+  opa:
+    image: openpolicyagent/opa:1.10.1
+    container_name: lab-opa
+    restart: unless-stopped
+    command: ["run", "--server", "--log-format", "text", "--log-level", "info", "--addr", "0.0.0.0:8181", "/policies"]
+    environment:
+      # OPA ходит в Lakekeeper под технической учёткой trino и спрашивает права за пользователя
+      LAKEKEEPER_URL: http://lakekeeper:8181
+      LAKEKEEPER_TOKEN_ENDPOINT: http://keycloak:8080/realms/iceberg/protocol/openid-connect/token
+      LAKEKEEPER_CLIENT_ID: trino
+      LAKEKEEPER_CLIENT_SECRET: e5sx35mYVkG3p3dAu1IYYgfCm0wBjbIK
+      LAKEKEEPER_SCOPE: lakekeeper
+      TRINO_LAKEKEEPER_CATALOG_NAME: lakekeeper
+      LAKEKEEPER_LAKEKEEPER_WAREHOUSE: demo
+      # каталоги вне Lakekeeper открыты всем вошедшим. В стенде такой каталог один - tpch
+      # с тестовыми данными (только чтение). Добавляя в trino/catalog другие, помните об этом флаге.
+      TRINO_ALLOW_UNMANAGED_CATALOGS: "true"
+    volumes:
+      - ./opa/policies:/policies:ro
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    logging: *logging
+
+  trino:
+    image: trinodb/trino:476
+    container_name: lab-trino
+    restart: unless-stopped
+    # общий секрет Trino берётся из тома, сгенерированного secrets-init
+    entrypoint: ["/bin/sh", "-c", "export TRINO_SHARED_SECRET=$$(cat /secrets/trino-shared-secret) && exec /usr/lib/trino/bin/run-trino"]
+    environment:
+      OIDC_ISSUER: http://localhost:30080/realms/iceberg
+      # без UTF-8 локали trino CLI внутри контейнера портит кириллицу в запросах
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    volumes:
+      - ./trino/config.properties:/etc/trino/config.properties:ro
+      - ./trino/access-control.properties:/etc/trino/access-control.properties:ro
+      # папка каталогов целиком: заменяет стандартные каталоги образа (jmx, memory, tpcds),
+      # в Trino остаются только lakekeeper и tpch
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - lab-secrets:/secrets:ro
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+      lk-init:
+        condition: service_completed_successfully
+      opa:
+        condition: service_started
+    healthcheck:
+      # /v1/info отвечает 200 ещё во время инициализации, ждём "starting":false
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging: *logging
+
+  trino-proxy:
+    image: nginx:1.30.5-alpine
+    container_name: lab-trino-proxy
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - lab-secrets:/etc/nginx/certs:ro
+    depends_on:
+      trino:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8443/v1/info || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    logging: *logging
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        # Подсеть задана явно. Если она занята у вас другой сетью, поменяйте третье число.
+        - subnet: 172.30.90.0/24
+
+volumes:
+  db-data:
+  openfga-db-data:
+  rustfs-data:
+  lab-secrets:

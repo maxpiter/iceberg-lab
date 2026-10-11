@@ -1,0 +1,15 @@
+Iceberg Lab
+Copyright 2026 Maxim Yudin
+
+This project includes OPA policies (opa/policies, except
+opa/policies/trino/allow_managed.rego) and configuration examples taken from
+Lakekeeper (https://github.com/lakekeeper/lakekeeper), tag v0.13.6,
+licensed under the Apache License, Version 2.0.
+
+The NOTICE file of Lakekeeper reads:
+
+  Lakekeeper
+  Copyright 2024-2026 Vakamo Inc.
+
+  This product includes software developed at
+  The Apache Software Foundation (http://www.apache.org/)
