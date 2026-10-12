@@ -161,7 +161,48 @@ ORDER BY made_current_at;
 
 Откат меняет таблицу, поэтому нужно право на запись (`modify`). У analyst с правом `select` команда получит `Access Denied`.
 
-> В официальных политиках OPA от Lakekeeper процедуры `rollback_to_snapshot` нет в списке разрешённых, и Trino отказывает в ней всем. Стенд добавляет её отдельным файлом `opa/policies/trino/allow_managed.rego` с тем же условием, что и для процедур обслуживания: право на запись в таблицу.
+### Почему откат пришлось разрешать отдельно
+
+Если поставить связку Trino, OPA и Lakekeeper по официальной инструкции, `rollback_to_snapshot` не сработает ни у кого, даже у администратора каталога: Trino ответит `Access Denied`. В стенде это исправлено, и вот как.
+
+Перед каждым действием Trino спрашивает OPA, можно ли его выполнить (см. [03-access.md](03-access.md#что-происходит-на-каждый-запрос)). OPA отвечает по правилам - файлам на языке Rego в папке `opa/policies/`. Правила для связки с Trino поставляет проект Lakekeeper, стенд использует их из версии 0.13.6 без изменений.
+
+В официальном `opa/policies/trino/allow_table.rego` процедуры вида `ALTER TABLE ... EXECUTE` разрешаются по жёсткому списку:
+
+```
+OPTIMIZE, OPTIMIZE_MANIFESTS, EXPIRE_SNAPSHOTS,
+DROP_EXTENDED_STATS, REMOVE_ORPHAN_FILES, ADD_FILES
+```
+
+и только тем, у кого есть право записи в таблицу. `ROLLBACK_TO_SNAPSHOT` в списке нет. Всё, что не разрешено явно, OPA запрещает: в `main.rego` стоит `default allow := false`.
+
+Официальные файлы лучше не править: при обновлении Lakekeeper правка потеряется. Для своих правил в `main.rego` оставлена точка расширения:
+
+```rego
+# Extension point for managed catalogs.
+# Create policies/trino/allow_managed.rego with rules that set allow_managed to true.
+allow if { allow_managed }
+```
+
+Стенд кладёт рядом файл `opa/policies/trino/allow_managed.rego`:
+
+```rego
+allow_managed if {
+	input.action.operation == "ExecuteTableProcedure"                       # процедура таблицы
+	input.action.resource.function.functionName == "ROLLBACK_TO_SNAPSHOT"   # именно откат
+	table := input.action.resource.table.tableName
+	is_metadata_table(table) == false                                        # не служебная $-таблица
+	catalog := input.action.resource.table.catalogName
+	schema := input.action.resource.table.schemaName
+	require_table_access_simple(catalog, schema, table, "write_data")       # есть право записи
+}
+```
+
+Это копия официального правила для процедур обслуживания, только для одной процедуры. Условие то же: `require_table_access_simple` спрашивает Lakekeeper, а тот - OpenFGA, есть ли у пользователя `write_data` на таблицу. Поэтому право на откат выдаётся в UI Lakekeeper той же галочкой `modify`, что и право на `optimize`. Отдельно ничего настраивать не нужно.
+
+Проверка: engineer откатывает таблицу, analyst с правом только на `select` получает `Access Denied`.
+
+Почему откат не вошёл в официальный список, в документации Lakekeeper не сказано. Переносите связку в свою систему - перенесите и этот файл, или проверьте, не появился ли откат в официальных правилах новой версии.
 
 ## Сколько живут снимки
 
