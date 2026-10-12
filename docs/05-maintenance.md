@@ -139,7 +139,32 @@ Lakekeeper умеет часть работы делать сам. В верси
 
 ## Старые metadata.json
 
-Каждое изменение таблицы, включая `ALTER TABLE` и процедуры обслуживания, создаёт новый `metadata.json`. Процедуры выше их не удаляют. За это отвечают свойства таблицы `write.metadata.delete-after-commit.enabled` и `write.metadata.previous-versions-max`: Lakekeeper по умолчанию хранит последние 100 версий и удаляет более старые при очередной записи. Trino менять эти свойства не даёт, их задают через другие клиенты каталога, например Spark.
+Каждое изменение таблицы, включая `ALTER TABLE` и процедуры обслуживания, создаёт новый `metadata.json`. Процедуры выше их не удаляют. За это отвечают свойства таблицы `write.metadata.delete-after-commit.enabled` и `write.metadata.previous-versions-max`. Lakekeeper по умолчанию хранит последние 100 версий и удаляет более старые при очередной записи.
+
+Задать эти свойства можно прямо из Trino, через `extra_properties`. По умолчанию Trino такие свойства не пропускает и отвечает `Illegal keys in extra_properties`, поэтому в настройках каталога стенда (`trino/catalog/lakekeeper.properties`) они разрешены одной строкой:
+
+```properties
+iceberg.allowed-extra-properties=write.metadata.delete-after-commit.enabled,write.metadata.previous-versions-max
+```
+
+Оставим у `orders_m` пять предыдущих версий:
+
+```sql
+ALTER TABLE lakekeeper.sales.orders_m SET PROPERTIES extra_properties = MAP(
+  ARRAY['write.metadata.delete-after-commit.enabled', 'write.metadata.previous-versions-max'],
+  ARRAY['true', '5']);
+```
+
+Свойства добавляются к уже заданным, остальные свойства таблицы не меняются. Проверить:
+
+```sql
+SELECT key, value FROM lakekeeper.sales."orders_m$properties"
+WHERE key LIKE 'write.metadata%';
+```
+
+Откройте папку `metadata/` таблицы в консоли RustFS. Файлов `metadata.json` там уже шесть, текущий и пять предыдущих. `ALTER TABLE` тоже создаёт новую версию таблицы, и лишние файлы удалились сразу при нём. Повторите пару вставок из шага 1 и обновите папку, файлов по-прежнему шесть, номера в именах сдвинулись.
+
+Это же можно задать сразу при создании таблицы, в `WITH (extra_properties = MAP(...))`.
 
 ## Кто может обслуживать таблицу
 
@@ -157,6 +182,7 @@ ALTER TABLE lakekeeper.sales.orders EXECUTE optimize;
 - Мелкие файлы, снимки, манифесты, сироты и старые метаданные копятся при любой нагрузке на запись.
 - `optimize` сливает файлы, `expire_snapshots` удаляет старые снимки и освобождает место, `remove_orphan_files` убирает сирот, `optimize_manifests` сжимает манифесты.
 - Место в S3 освобождается только после `expire_snapshots`.
+- Старые `metadata.json` процедуры не удаляют, для этого у таблицы задают `write.metadata.previous-versions-max`.
 - В рабочей системе сроки хранения не ставят в ноль.
 - Для обслуживания нужно право на запись в таблицу.
 
